@@ -1,36 +1,34 @@
--- screens/feed.lua — Scrollable earthquake feed
+-- screens/feed.lua — Global news article feed
 
 local ui = require("lib.ui")
 
 local M = {}
 
-local VISIBLE_ROWS = 12
-local ROW_H = 52
+local VISIBLE_ROWS = 11
+local ROW_H = 58
 local CONTENT_Y = 42
 
---- Draw the feed screen
 function M.draw(state)
     local W = 720
-    local quakes = state.quakes or {}
+    local articles = state.articles or {}
 
     -- Column headers
     screen.draw_rect(0, CONTENT_Y, W, 18, {color = ui.colors.panel, filled = true})
-    screen.draw_text("MAG", 12, CONTENT_Y + 2, {color = ui.colors.text_dim, size = 10, bold = true})
-    screen.draw_text("LOCATION", 80, CONTENT_Y + 2, {color = ui.colors.text_dim, size = 10, bold = true})
-    screen.draw_text("DEPTH", 520, CONTENT_Y + 2, {color = ui.colors.text_dim, size = 10, bold = true})
-    screen.draw_text("TIME", 620, CONTENT_Y + 2, {color = ui.colors.text_dim, size = 10, bold = true})
+    screen.draw_text("SOURCE", 12, CONTENT_Y + 2, {color = ui.colors.text_dim, size = 10, bold = true})
+    screen.draw_text("HEADLINE", 160, CONTENT_Y + 2, {color = ui.colors.text_dim, size = 10, bold = true})
+    screen.draw_text("TIME", 640, CONTENT_Y + 2, {color = ui.colors.text_dim, size = 10, bold = true})
 
-    if #quakes == 0 then
-        screen.draw_text("No earthquake data", W / 2 - 60, 300, {color = ui.colors.text_dim, size = 14})
+    if #articles == 0 then
+        screen.draw_text("No articles loaded", W / 2 - 60, 300, {color = ui.colors.text_dim, size = 14})
         return
     end
 
     local list_y = CONTENT_Y + 20
     local start_idx = state.feed_scroll + 1
-    local end_idx = math.min(#quakes, start_idx + VISIBLE_ROWS - 1)
+    local end_idx = math.min(#articles, start_idx + VISIBLE_ROWS - 1)
 
     for i = start_idx, end_idx do
-        local q = quakes[i]
+        local art = articles[i]
         local ry = list_y + (i - start_idx) * ROW_H
         local is_selected = (i == state.feed_cursor)
 
@@ -42,32 +40,41 @@ function M.draw(state)
             screen.draw_rect(0, ry, 3, ROW_H, {color = ui.colors.accent, filled = true})
         end
 
-        -- Magnitude badge
-        local mc = ui.mag_color(q.mag)
-        screen.draw_pill(string.format("%.1f", q.mag), 10, ry + 8, mc[1], mc[2], mc[3], {
-            text_color = {10, 10, 10}, size = 13,
+        -- Source domain
+        local domain = ui.short_domain(art.domain)
+        screen.draw_text(domain, 12, ry + 8, {color = ui.colors.accent, size = 11, bold = true, max_width = 140})
+
+        -- Country
+        if art.country and art.country ~= "" then
+            screen.draw_text(art.country, 12, ry + 26, {
+                color = ui.colors.text_dim, size = 9, max_width = 140,
+            })
+        end
+
+        -- Language pill
+        if art.language and art.language ~= "" then
+            local lang = art.language:sub(1, 3):upper()
+            screen.draw_pill(lang, 12, ry + 40, 30, 45, 55, {
+                text_color = ui.colors.text_dim, size = 8,
+            })
+        end
+
+        -- Headline
+        screen.draw_text(art.title, 160, ry + 8, {
+            color = ui.colors.text, size = 12, max_width = 470,
         })
 
-        -- Severity label
-        screen.draw_text(ui.mag_label(q.mag), 10, ry + 30, {color = mc, size = 9, bold = true})
-
-        -- Location
-        screen.draw_text(q.place, 80, ry + 8, {color = ui.colors.text, size = 12, max_width = 430})
-
-        -- Coordinates
-        screen.draw_text(
-            string.format("%.2f, %.2f", q.lat, q.lon),
-            80, ry + 28, {color = ui.colors.text_dim, size = 10}
-        )
-
-        -- Depth
-        screen.draw_text(string.format("%.0f km", q.depth), 520, ry + 8, {
-            color = ui.colors.text_dim, size = 11,
-        })
+        -- Second line of title if it was truncated
+        if screen.get_text_width(art.title, 12, false) > 470 then
+            -- Show what we can
+            screen.draw_text(art.title, 160, ry + 28, {
+                color = ui.colors.text_dim, size = 11, max_width = 470,
+            })
+        end
 
         -- Time
-        screen.draw_text(ui.time_ago(q.time), 620, ry + 8, {
-            color = ui.colors.text_dim, size = 11,
+        screen.draw_text(ui.format_date(art.date), 640, ry + 8, {
+            color = ui.colors.text_dim, size = 10,
         })
 
         -- Separator
@@ -75,30 +82,28 @@ function M.draw(state)
     end
 
     -- Scroll indicator
-    if #quakes > VISIBLE_ROWS then
+    if #articles > VISIBLE_ROWS then
         local bar_h = 620
-        local thumb_h = math.max(20, bar_h * VISIBLE_ROWS / #quakes)
-        local thumb_y = list_y + (bar_h - thumb_h) * state.feed_scroll / math.max(1, #quakes - VISIBLE_ROWS)
+        local thumb_h = math.max(20, bar_h * VISIBLE_ROWS / #articles)
+        local thumb_y = list_y + (bar_h - thumb_h) * state.feed_scroll / math.max(1, #articles - VISIBLE_ROWS)
         screen.draw_rect(W - 4, list_y, 3, bar_h, {color = ui.colors.panel, filled = true, radius = 1})
         screen.draw_rect(W - 4, thumb_y, 3, thumb_h, {color = ui.colors.accent_dim, filled = true, radius = 1})
     end
 
     -- Count
-    local count_text = string.format("%d of %d events", end_idx, #quakes)
+    local count_text = string.format("%d of %d articles", end_idx, #articles)
     local cw = screen.get_text_width(count_text, 10, false)
     screen.draw_text(count_text, W - cw - 12, CONTENT_Y + 2, {color = ui.colors.text_dim, size = 10})
 end
 
---- Handle input on feed screen
 function M.on_input(state, button, action)
     if action ~= "press" and action ~= "repeat" then return nil end
 
-    local n = state.quakes and #state.quakes or 0
+    local n = state.articles and #state.articles or 0
     if n == 0 then return nil end
 
     if button == "dpad_down" then
         state.feed_cursor = math.min(n, state.feed_cursor + 1)
-        -- Scroll to keep cursor visible
         if state.feed_cursor > state.feed_scroll + VISIBLE_ROWS then
             state.feed_scroll = state.feed_cursor - VISIBLE_ROWS
         end

@@ -15,37 +15,37 @@ M.colors = {
     orange    = {255, 170, 0},
     yellow    = {255, 220, 50},
     green     = {0, 200, 100},
-    mag_low   = {0, 200, 100},     -- M < 4
-    mag_med   = {255, 200, 0},     -- M 4-5.5
-    mag_high  = {255, 120, 0},     -- M 5.5-7
-    mag_crit  = {255, 50, 50},     -- M 7+
+    blue      = {80, 140, 255},
+    -- Tone/sentiment colors
+    tone_neg  = {255, 70, 60},    -- negative news (conflict, crisis)
+    tone_neu  = {255, 200, 50},   -- neutral
+    tone_pos  = {0, 200, 100},    -- positive news
 }
 
-function M.mag_color(mag)
-    if mag >= 7 then return M.colors.mag_crit end
-    if mag >= 5.5 then return M.colors.mag_high end
-    if mag >= 4 then return M.colors.mag_med end
-    return M.colors.mag_low
+--- Get color for a GDELT tone value
+function M.tone_color(tone)
+    if tone < -3 then return M.colors.tone_neg end
+    if tone > 3 then return M.colors.tone_pos end
+    return M.colors.tone_neu
 end
 
-function M.mag_label(mag)
-    if mag >= 7 then return "CRITICAL" end
-    if mag >= 5.5 then return "STRONG" end
-    if mag >= 4 then return "MODERATE" end
-    return "MINOR"
+--- Tone label
+function M.tone_label(tone)
+    if tone < -5 then return "CRITICAL" end
+    if tone < -3 then return "NEGATIVE" end
+    if tone > 5 then return "VERY POSITIVE" end
+    if tone > 3 then return "POSITIVE" end
+    return "NEUTRAL"
 end
 
 --- Draw the top header bar
 function M.draw_header(title, tabs, active_tab)
     local W = 720
-    -- Gradient header background
     screen.draw_gradient_rect(0, 0, W, 36, 15, 25, 35, 10, 15, 20)
     screen.draw_line(0, 36, W, 36, {color = M.colors.accent_dim, width = 1})
 
-    -- Title
     screen.draw_text(title, 12, 8, {color = M.colors.accent, size = 14, bold = true})
 
-    -- Tabs
     if tabs and #tabs > 0 then
         local tx = 160
         for i, tab in ipairs(tabs) do
@@ -59,7 +59,6 @@ function M.draw_header(title, tabs, active_tab)
         end
     end
 
-    -- Timestamp
     local ts = os.date("%H:%M:%S")
     local tsw = screen.get_text_width(ts, 10, false)
     screen.draw_text(ts, W - tsw - 10, 12, {color = M.colors.text_dim, size = 10})
@@ -88,7 +87,7 @@ function M.draw_panel(x, y, w, h, title, opts)
     screen.draw_card(x, y, w, h, {bg = bg, border = border, radius = 4, shadow = false})
     if title then
         screen.draw_text(title, x + 8, y + 4, {color = M.colors.accent, size = 9, bold = true})
-        return y + 18 -- content start y
+        return y + 18
     end
     return y + 4
 end
@@ -98,17 +97,24 @@ function M.draw_dot(x, y, r, color)
     screen.draw_circle(x, y, r, color[1], color[2], color[3])
 end
 
---- Time ago string
-function M.time_ago(timestamp_ms)
-    local now = os.time() * 1000
-    local diff = now - timestamp_ms
-    local secs = math.floor(diff / 1000)
-    if secs < 60 then return secs .. "s ago" end
-    local mins = math.floor(secs / 60)
-    if mins < 60 then return mins .. "m ago" end
-    local hours = math.floor(mins / 60)
-    if hours < 24 then return hours .. "h ago" end
-    return math.floor(hours / 24) .. "d ago"
+--- Format GDELT date (20260315T120000Z) to readable
+function M.format_date(gdelt_date)
+    if not gdelt_date or #gdelt_date < 8 then return "" end
+    local h = gdelt_date:sub(10, 11) or "00"
+    local m = gdelt_date:sub(12, 13) or "00"
+    return h .. ":" .. m .. " UTC"
+end
+
+--- Truncate domain for display
+function M.short_domain(domain)
+    if not domain then return "" end
+    -- Remove www. prefix
+    domain = domain:gsub("^www%.", "")
+    -- Truncate if too long
+    if #domain > 25 then
+        return domain:sub(1, 22) .. "..."
+    end
+    return domain
 end
 
 return M

@@ -1,5 +1,5 @@
--- World Pulse — Global earthquake monitor and intelligence dashboard
--- Real-time seismic data from USGS + ISS tracking
+-- World Pulse — Global intelligence monitor
+-- Real-time news events from GDELT + ISS tracking
 
 local ui = require("lib.ui")
 local geo = require("lib.geo")
@@ -10,33 +10,34 @@ local stats_screen = require("screens.stats")
 
 -- ── State ──────────────────────────────────────────────────────────────────
 
-local TABS = {"MAP", "FEED", "STATS"}
+local TABS = {"MAP", "NEWS", "STATS"}
 
 local state = {
     screen = "boot",
-    tab = 1,  -- 1=map, 2=feed, 3=stats
+    tab = 1,
 
     -- Boot sequence
     boot_time = 0,
-    boot_phase = 0,
     boot_sources = {
-        {name = "USGS EARTHQUAKE DATA", status = "WAIT", delay = 0.4},
-        {name = "ISS TRACKING API",     status = "WAIT", delay = 0.8},
-        {name = "MAP RENDERER",         status = "WAIT", delay = 1.2},
-        {name = "SIGNAL PROCESSOR",     status = "WAIT", delay = 1.6},
+        {name = "GDELT EVENT STREAM",   status = "WAIT", delay = 0.3},
+        {name = "GDELT NEWS FEED",      status = "WAIT", delay = 0.7},
+        {name = "ISS TRACKING API",     status = "WAIT", delay = 1.1},
+        {name = "MAP RENDERER",         status = "WAIT", delay = 1.4},
+        {name = "SIGNAL PROCESSOR",     status = "WAIT", delay = 1.7},
     },
 
     -- Data
-    quakes = nil,
+    events = nil,          -- geolocated news events (for map)
+    articles = nil,        -- news articles (for feed)
     iss = nil,
-    quake_summary = nil,
+    event_summary = nil,
 
     -- Timers
     anim_time = 0,
     poll_timer = 0,
-    poll_interval = 120,   -- quakes every 2 min
+    poll_interval = 300,   -- refresh every 5 min
     iss_timer = 0,
-    iss_interval = 15,     -- ISS every 15 sec
+    iss_interval = 15,
 
     -- UI state
     map_cursor = 1,
@@ -56,21 +57,27 @@ local function fetch_all()
     state.loading = true
     state.last_error = ""
 
-    local quakes, err = data.fetch_quakes()
-    if quakes then
-        state.quakes = quakes
-        state.quake_summary = data.summarize_quakes(quakes)
+    -- Fetch geolocated events for the map
+    local events, err = data.fetch_events()
+    if events then
+        state.events = events
+        state.event_summary = data.summarize_events(events)
         state.last_update_str = os.date("%H:%M:%S")
     else
-        state.last_error = err or "Fetch failed"
+        state.last_error = err or "Events fetch failed"
     end
 
-    local iss, iss_err = data.fetch_iss()
-    if iss then
-        state.iss = iss
-    elseif not state.last_error or state.last_error == "" then
-        state.last_error = iss_err or "ISS fetch failed"
+    -- Fetch news articles for the feed
+    local articles, art_err = data.fetch_articles()
+    if articles then
+        state.articles = articles
+    elseif state.last_error == "" then
+        state.last_error = art_err or "Articles fetch failed"
     end
+
+    -- Fetch ISS
+    local iss, _ = data.fetch_iss()
+    if iss then state.iss = iss end
 
     state.loading = false
 end
@@ -83,11 +90,13 @@ end
 -- ── Lifecycle ──────────────────────────────────────────────────────────────
 
 function on_init()
-    -- Try to load cached data
-    local cached = storage.load("wp_quakes")
-    if cached and cached.quakes then
-        state.quakes = cached.quakes
-        state.quake_summary = data.summarize_quakes(cached.quakes)
+    local cached = storage.load("wp_data")
+    if cached then
+        state.events = cached.events
+        state.articles = cached.articles
+        if state.events then
+            state.event_summary = data.summarize_events(state.events)
+        end
     end
 end
 
@@ -96,15 +105,11 @@ function on_update(dt)
 
     if state.screen == "boot" then
         state.boot_time = state.boot_time + dt
-
-        -- Update boot source statuses
         for _, src in ipairs(state.boot_sources) do
             if state.boot_time >= src.delay and src.status == "WAIT" then
                 src.status = "OK"
             end
         end
-
-        -- After boot sequence, transition to map and start fetching
         if state.boot_time >= 2.5 then
             state.screen = "map"
             state.needs_initial_fetch = true
@@ -112,28 +117,26 @@ function on_update(dt)
         return
     end
 
-    -- Deferred initial fetch (after boot)
     if state.needs_initial_fetch then
         state.needs_initial_fetch = false
         fetch_all()
-        -- Cache quake data
-        if state.quakes then
-            storage.save("wp_quakes", {quakes = state.quakes})
+        if state.events then
+            storage.save("wp_data", {events = state.events, articles = state.articles})
         end
         return
     end
 
-    -- Periodic quake polling
+    -- Periodic polling
     state.poll_timer = state.poll_timer + dt
     if state.poll_timer >= state.poll_interval then
         state.poll_timer = 0
         fetch_all()
-        if state.quakes then
-            storage.save("wp_quakes", {quakes = state.quakes})
+        if state.events then
+            storage.save("wp_data", {events = state.events, articles = state.articles})
         end
     end
 
-    -- More frequent ISS polling
+    -- ISS polling
     state.iss_timer = state.iss_timer + dt
     if state.iss_timer >= state.iss_interval then
         state.iss_timer = 0
@@ -143,7 +146,6 @@ end
 
 function on_input(button, action)
     if state.screen == "boot" then
-        -- Skip boot on any press
         if action == "press" then
             state.screen = "map"
             state.needs_initial_fetch = true
@@ -152,7 +154,6 @@ function on_input(button, action)
     end
 
     if action == "press" or action == "repeat" then
-        -- Tab switching with L1/R1
         if button == "r1" then
             state.tab = state.tab % #TABS + 1
             state.screen = string.lower(TABS[state.tab])
@@ -164,11 +165,10 @@ function on_input(button, action)
         end
     end
 
-    -- Delegate to current screen
     local result = nil
     if state.screen == "map" then
         result = map_screen.on_input(state, button, action)
-    elseif state.screen == "feed" then
+    elseif state.screen == "news" then
         result = feed_screen.on_input(state, button, action)
     elseif state.screen == "stats" then
         result = stats_screen.on_input(state, button, action)
@@ -176,63 +176,48 @@ function on_input(button, action)
 
     if result == "refresh" then
         fetch_all()
-        if state.quakes then
-            storage.save("wp_quakes", {quakes = state.quakes})
+        if state.events then
+            storage.save("wp_data", {events = state.events, articles = state.articles})
         end
     end
 end
 
--- ── Boot screen rendering ──────────────────────────────────────────────────
+-- ── Boot screen ────────────────────────────────────────────────────────────
 
 local function draw_boot()
     local W, H = 720, 720
     local cx, cy = W / 2, H / 2 - 60
 
-    -- Animated reticle
     local pulse = (math.sin(state.boot_time * 4) + 1) / 2
     local ring_r = 60 + pulse * 10
     screen.draw_circle(cx, cy, ring_r, 0, 30 + pulse * 20, 25 + pulse * 15)
     screen.draw_circle(cx, cy, ring_r - 2, 10, 15, 20)
 
-    -- Cross-hairs
     local ch_len = 20
-    screen.draw_line(cx - ring_r - ch_len, cy, cx - ring_r + 8, cy,
-        {color = ui.colors.accent_dim, width = 1})
-    screen.draw_line(cx + ring_r - 8, cy, cx + ring_r + ch_len, cy,
-        {color = ui.colors.accent_dim, width = 1})
-    screen.draw_line(cx, cy - ring_r - ch_len, cx, cy - ring_r + 8,
-        {color = ui.colors.accent_dim, width = 1})
-    screen.draw_line(cx, cy + ring_r - 8, cx, cy + ring_r + ch_len,
-        {color = ui.colors.accent_dim, width = 1})
+    screen.draw_line(cx - ring_r - ch_len, cy, cx - ring_r + 8, cy, {color = ui.colors.accent_dim, width = 1})
+    screen.draw_line(cx + ring_r - 8, cy, cx + ring_r + ch_len, cy, {color = ui.colors.accent_dim, width = 1})
+    screen.draw_line(cx, cy - ring_r - ch_len, cx, cy - ring_r + 8, {color = ui.colors.accent_dim, width = 1})
+    screen.draw_line(cx, cy + ring_r - 8, cx, cy + ring_r + ch_len, {color = ui.colors.accent_dim, width = 1})
 
-    -- Title
     local title = "WORLD PULSE"
     local tw = screen.get_text_width(title, 24, true)
-    screen.draw_text(title, (W - tw) / 2, cy - 14, {
-        color = ui.colors.accent, size = 24, bold = true,
-    })
+    screen.draw_text(title, (W - tw) / 2, cy - 14, {color = ui.colors.accent, size = 24, bold = true})
 
-    -- Subtitle
     local sub = "GLOBAL INTELLIGENCE MONITOR"
     local sw = screen.get_text_width(sub, 10, false)
     screen.draw_text(sub, (W - sw) / 2, cy + 16, {color = ui.colors.text_dim, size = 10})
 
-    -- Version
-    local ver = "v0.1.0"
+    local ver = "v0.2.0"
     local vw = screen.get_text_width(ver, 9, false)
     screen.draw_text(ver, (W - vw) / 2, cy + 32, {color = ui.colors.accent_dim, size = 9})
 
-    -- Source initialization list
     local sy = cy + 80
-    screen.draw_text("INITIALIZING SYSTEMS", cx - 70, sy, {
-        color = ui.colors.text_dim, size = 10, bold = true,
-    })
+    screen.draw_text("INITIALIZING SYSTEMS", cx - 70, sy, {color = ui.colors.text_dim, size = 10, bold = true})
     sy = sy + 20
 
     for _, src in ipairs(state.boot_sources) do
         local status_color = src.status == "OK" and ui.colors.green or ui.colors.text_dim
         local status_text = src.status == "OK" and "OK" or ".."
-
         screen.draw_text(src.name, cx - 120, sy, {color = ui.colors.text_dim, size = 11})
         screen.draw_text("[" .. status_text .. "]", cx + 100, sy, {
             color = status_color, size = 11, bold = src.status == "OK",
@@ -240,21 +225,17 @@ local function draw_boot()
         sy = sy + 18
     end
 
-    -- Progress bar
     local prog = math.min(1, state.boot_time / 2.5)
     screen.draw_progress_bar(cx - 120, sy + 10, 240, 4, prog, {
-        fill_color = ui.colors.accent,
-        bg_color = ui.colors.panel,
-        radius = 2,
+        fill_color = ui.colors.accent, bg_color = ui.colors.panel, radius = 2,
     })
 
-    -- Skip hint
     local skip = "Press any button to skip"
     local skw = screen.get_text_width(skip, 9, false)
     screen.draw_text(skip, (W - skw) / 2, H - 40, {color = ui.colors.text_dim, size = 9})
 end
 
--- ── Main render ────────────────────────────────────────────────────────────
+-- ── Render ─────────────────────────────────────────────────────────────────
 
 function on_render()
     screen.clear(ui.colors.bg[1], ui.colors.bg[2], ui.colors.bg[3])
@@ -264,19 +245,16 @@ function on_render()
         return
     end
 
-    -- Header with tabs
     ui.draw_header("WORLD PULSE", TABS, state.tab)
 
-    -- Screen content
     if state.screen == "map" then
         map_screen.draw(state)
-    elseif state.screen == "feed" then
+    elseif state.screen == "news" then
         feed_screen.draw(state)
     elseif state.screen == "stats" then
         stats_screen.draw(state)
     end
 
-    -- Footer
     ui.draw_footer({
         {"L1", "Prev", theme.btn_l},
         {"R1", "Next", theme.btn_r},

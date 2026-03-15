@@ -1,44 +1,76 @@
--- lib/data.lua — Data fetching and parsing
+-- lib/data.lua — Data fetching from GDELT and ISS
 
 local M = {}
 
---- Fetch earthquake data from USGS
--- Returns table of quakes: {mag, lat, lon, place, time, depth}
-function M.fetch_quakes()
-    local url = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson"
-    local resp = http.get_cached(url, 120)
+--- Fetch geolocated news events from GDELT
+-- Returns table of events: {lat, lon, name, url, title, tone, domain, country, image}
+function M.fetch_events()
+    local url = "https://api.gdeltproject.org/api/v2/geo/geo?query=&mode=pointdata&format=geojson&maxpoints=200&timespan=24h"
+    local resp = http.get_cached(url, 300)
     if not resp.ok then
-        return nil, "USGS: HTTP " .. tostring(resp.status)
+        return nil, "GDELT GEO: HTTP " .. tostring(resp.status)
     end
 
     local data = json.decode(resp.body)
     if not data or not data.features then
-        return nil, "USGS: bad response"
+        return nil, "GDELT GEO: bad response"
     end
 
-    local quakes = {}
+    local events = {}
     for _, feat in ipairs(data.features) do
         local props = feat.properties or {}
         local geom = feat.geometry or {}
         local coords = geom.coordinates or {}
-        quakes[#quakes + 1] = {
-            mag   = props.mag or 0,
-            place = props.place or "Unknown",
-            time  = props.time or 0,
-            lon   = coords[1] or 0,
-            lat   = coords[2] or 0,
-            depth = coords[3] or 0,
+        if #coords >= 2 then
+            events[#events + 1] = {
+                lon     = coords[1],
+                lat     = coords[2],
+                name    = props.name or "",
+                url     = props.url or "",
+                title   = props.name or "",
+                tone    = tonumber(props.tonez) or 0,
+                domain  = props.domain or "",
+                country = props.countrycode or "",
+                image   = props.shareimage or "",
+                count   = tonumber(props.count) or 1,
+            }
+        end
+    end
+
+    return events
+end
+
+--- Fetch news articles from GDELT
+-- Returns table of articles: {title, url, domain, date, country, language, image}
+function M.fetch_articles()
+    local url = "https://api.gdeltproject.org/api/v2/doc/doc?query=&mode=artlist&maxrecords=75&format=json&sort=datedesc"
+    local resp = http.get_cached(url, 300)
+    if not resp.ok then
+        return nil, "GDELT DOC: HTTP " .. tostring(resp.status)
+    end
+
+    local data = json.decode(resp.body)
+    if not data or not data.articles then
+        return nil, "GDELT DOC: bad response"
+    end
+
+    local articles = {}
+    for _, art in ipairs(data.articles) do
+        articles[#articles + 1] = {
+            title    = art.title or "",
+            url      = art.url or "",
+            domain   = art.domain or "",
+            date     = art.seendate or "",
+            country  = art.sourcecountry or "",
+            language = art.language or "",
+            image    = art.socialimage or "",
         }
     end
 
-    -- Sort by time descending (most recent first)
-    table.sort(quakes, function(a, b) return a.time > b.time end)
-
-    return quakes
+    return articles
 end
 
 --- Fetch ISS position
--- Returns {lat, lon, timestamp}
 function M.fetch_iss()
     local resp = http.get("http://api.open-notify.org/iss-now.json")
     if not resp.ok then
@@ -57,36 +89,44 @@ function M.fetch_iss()
     }
 end
 
---- Summarize earthquake data
-function M.summarize_quakes(quakes)
-    if not quakes or #quakes == 0 then
-        return {total = 0, max_mag = 0, avg_mag = 0, by_range = {0, 0, 0, 0}}
+--- Summarize events for the stats screen
+function M.summarize_events(events)
+    if not events or #events == 0 then
+        return {total = 0, negative = 0, neutral = 0, positive = 0, countries = {}}
     end
 
-    local total = #quakes
-    local max_mag = 0
-    local sum = 0
-    local by_range = {0, 0, 0, 0} -- <4, 4-5.5, 5.5-7, 7+
+    local total = #events
+    local negative, neutral, positive = 0, 0, 0
+    local country_counts = {}
 
-    for _, q in ipairs(quakes) do
-        if q.mag > max_mag then max_mag = q.mag end
-        sum = sum + q.mag
-        if q.mag >= 7 then
-            by_range[4] = by_range[4] + 1
-        elseif q.mag >= 5.5 then
-            by_range[3] = by_range[3] + 1
-        elseif q.mag >= 4 then
-            by_range[2] = by_range[2] + 1
+    for _, ev in ipairs(events) do
+        if ev.tone < -3 then
+            negative = negative + 1
+        elseif ev.tone > 3 then
+            positive = positive + 1
         else
-            by_range[1] = by_range[1] + 1
+            neutral = neutral + 1
+        end
+
+        local c = ev.country
+        if c and c ~= "" then
+            country_counts[c] = (country_counts[c] or 0) + 1
         end
     end
 
+    -- Top countries by event count
+    local countries = {}
+    for code, count in pairs(country_counts) do
+        countries[#countries + 1] = {code = code, count = count}
+    end
+    table.sort(countries, function(a, b) return a.count > b.count end)
+
     return {
         total = total,
-        max_mag = max_mag,
-        avg_mag = sum / total,
-        by_range = by_range,
+        negative = negative,
+        neutral = neutral,
+        positive = positive,
+        countries = countries,
     }
 end
 
