@@ -1,0 +1,1 @@
+{"id":"dev.cartridge.worldpulse","name":"World Pulse","version":"0.1.0","author":"Cartridge","description":"Real-time global earthquake monitor and intelligence dashboard","category":"Tools","tags":["world","monitor","earthquakes","dashboard","intelligence","map"],"permissions":["network","storage"],"entry":"main.lua"}
