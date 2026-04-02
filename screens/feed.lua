@@ -59,18 +59,10 @@ function M.draw(state)
             })
         end
 
-        -- Headline
-        screen.draw_text(art.title, 160, ry + 8, {
-            color = ui.colors.text, size = 12, max_width = 470,
+        -- Headline (single line, truncated with ..)
+        screen.draw_text(art.title, 160, ry + 14, {
+            color = ui.colors.text, size = 13, max_width = 470,
         })
-
-        -- Second line of title if it was truncated
-        if screen.get_text_width(art.title, 12, false) > 470 then
-            -- Show what we can
-            screen.draw_text(art.title, 160, ry + 28, {
-                color = ui.colors.text_dim, size = 11, max_width = 470,
-            })
-        end
 
         -- Time
         screen.draw_text(ui.format_date(art.date), 640, ry + 8, {
