@@ -1,1 +1,24 @@
-{"id":"dev.cartridge.worldpulse","name":"World Pulse","version":"0.2.0","author":"Cartridge","description":"Real-time global news monitor and intelligence dashboard","category":"Tools","tags":["world","monitor","news","intelligence","dashboard","map","geopolitics"],"permissions":["network","storage"],"entry":"main.lua"}
+{
+  "id": "dev.cartridge.worldpulse",
+  "name": "World Pulse",
+  "version": "0.3.0",
+  "author": "Cartridge",
+  "description": "A controller-operated news atlas with reported locations, coverage summaries and ISS position.",
+  "category": "tools",
+  "tags": [
+    "world",
+    "monitor",
+    "news",
+    "intelligence",
+    "dashboard",
+    "map",
+    "geopolitics"
+  ],
+  "permissions": [
+    "network",
+    "storage"
+  ],
+  "entry": "main.lua",
+  "min_runtime": "0.7.0",
+  "icon": "icon.png"
+}

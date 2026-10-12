@@ -1,264 +1,236 @@
--- World Pulse — Global intelligence monitor
--- Real-time news events from GDELT + ISS tracking
-
+-- World Pulse: a news atlas of GDELT coverage, with separate ISS samples.
+local U = _G.ui.public
+local C = U.C
 local ui = require("lib.ui")
-local geo = require("lib.geo")
 local data = require("lib.data")
 local map_screen = require("screens.map")
 local feed_screen = require("screens.feed")
 local stats_screen = require("screens.stats")
-
--- ── State ──────────────────────────────────────────────────────────────────
-
-local TABS = {"MAP", "NEWS", "STATS"}
-
+local TABS = {"Atlas", "News", "Stats"}
+local SCREENS = {"map", "news", "stats"}
+local SOURCE_ORDER = {"events", "articles", "iss"}
+local REQUEST_TIMEOUT = 20
+-- All requests to the GDELT API share one start gate; ISS is independent.
+local GDELT_START_GAP = 6
+-- The SDK does not expose Retry-After headers. A 429 pauses both GDELT
+-- sources for ten minutes, persisted across launches, without endpoint hopping.
+local RATE_LIMIT_COOLDOWN = 600
+local sources = {}
+for _, kind in ipairs(SOURCE_ORDER) do
+    sources[kind] = {status = "idle", error = "", queued = true, next_start = 0}
+end
 local state = {
-    screen = "boot",
-    tab = 1,
-
-    -- Boot sequence
-    boot_time = 0,
-    boot_sources = {
-        {name = "GDELT EVENT STREAM",   status = "WAIT", delay = 0.3},
-        {name = "GDELT NEWS FEED",      status = "WAIT", delay = 0.7},
-        {name = "ISS TRACKING API",     status = "WAIT", delay = 1.1},
-        {name = "MAP RENDERER",         status = "WAIT", delay = 1.4},
-        {name = "SIGNAL PROCESSOR",     status = "WAIT", delay = 1.7},
-    },
-
-    -- Data
-    events = nil,          -- geolocated news events (for map)
-    articles = nil,        -- news articles (for feed)
-    iss = nil,
-    event_summary = nil,
-
-    -- Timers
-    anim_time = 0,
-    poll_timer = 0,
-    poll_interval = 300,   -- refresh every 5 min
-    iss_timer = 0,
-    iss_interval = 15,
-
-    -- UI state
-    map_cursor = 1,
-    feed_cursor = 1,
-    feed_scroll = 0,
-
-    -- Status
-    loading = false,
-    last_error = "",
-    last_update_str = "never",
-    needs_initial_fetch = false,
+    screen = "map", tab = 1, sources = sources, clock = 0,
+    map_cursor = 1, feed_cursor = 1, feed_scroll = 0, feed_detail = false,
+    poll_timer = 0, poll_interval = 300, iss_timer = 0, iss_interval = 15,
+    loading = false, gdelt_next_start = 0, gdelt_cooldown_until = 0,
 }
 
--- ── Data fetching ──────────────────────────────────────────────────────────
+local function save_cache()
+    local retry_at
+    if state.gdelt_cooldown_until > state.clock then
+        retry_at = os.time() + math.ceil(state.gdelt_cooldown_until - state.clock)
+    end
+    storage.save("wp_data", {events = state.events, articles = state.articles,
+        events_at = sources.events.updated_at, articles_at = sources.articles.updated_at,
+        gdelt_retry_at = retry_at})
+end
 
-local function fetch_all()
-    state.loading = true
-    state.last_error = ""
+local function queue_refresh(kind)
+    local source = sources[kind]
+    -- Repeated refreshes coalesce into one request, including during cooldown.
+    if source.id or source.queued then return false end
+    source.queued = true
+    source.status = "queued"
+    return true
+end
 
-    -- Fetch geolocated events for the map
-    local events, err = data.fetch_events()
-    if events then
-        state.events = events
-        state.event_summary = data.summarize_events(events)
-        state.last_update_str = os.date("%H:%M:%S")
+local function start_request(kind)
+    local source = sources[kind]
+    if not source.queued or source.id then return false end
+    local earliest = source.next_start
+    if kind ~= "iss" then
+        earliest = math.max(earliest, state.gdelt_next_start, state.gdelt_cooldown_until)
+    end
+    if state.clock < earliest then
+        local reason = kind ~= "iss" and state.clock < state.gdelt_cooldown_until and "HTTP 429 cooldown"
+            or kind ~= "iss" and state.clock < state.gdelt_next_start and "GDELT request spacing"
+            or "Source refresh interval"
+        local changed = source.status ~= "queued" or source.waiting_for ~= reason
+        source.status, source.waiting_for = "queued", reason
+        return changed
+    end
+    source.queued, source.waiting_for = false, nil
+    source.next_start = state.clock + (kind == "iss" and 15 or GDELT_START_GAP)
+    if not http.get_async or not http.poll then
+        source.status, source.error = "error", "Async HTTP unavailable"
+        return true
+    end
+    if kind ~= "iss" then state.gdelt_next_start = state.clock + GDELT_START_GAP end
+    local ok, id = pcall(http.get_async, data.urls[kind])
+    if not ok or not id then
+        source.status, source.error = "error", "Could not start request"
     else
-        state.last_error = err or "Events fetch failed"
+        source.id, source.started = id, state.clock
+        source.status, source.error, source.timed_out = "loading", "", false
     end
-
-    -- Fetch news articles for the feed
-    local articles, art_err = data.fetch_articles()
-    if articles then
-        state.articles = articles
-    elseif state.last_error == "" then
-        state.last_error = art_err or "Articles fetch failed"
-    end
-
-    -- Fetch ISS
-    local iss, _ = data.fetch_iss()
-    if iss then state.iss = iss end
-
-    state.loading = false
+    return true
 end
 
-local function fetch_iss_only()
-    local iss, _ = data.fetch_iss()
-    if iss then state.iss = iss end
+local function accept_response(kind, response)
+    local source = sources[kind]
+    source.id = nil
+    -- A timed-out physical request retains its slot until drained. A late result
+    -- is ignored and cannot overwrite the data or create overlapping requests.
+    if source.timed_out then source.timed_out = false; return end
+    if response.status == 429 then
+        source.error = "HTTP 429 / 10-minute cooldown"
+        if kind ~= "iss" then
+            state.gdelt_cooldown_until = math.max(state.gdelt_cooldown_until, state.clock + RATE_LIMIT_COOLDOWN)
+            state.gdelt_next_start = math.max(state.gdelt_next_start, state.gdelt_cooldown_until)
+            for _, gdelt_kind in ipairs({"events", "articles"}) do
+                local queued = sources[gdelt_kind]
+                if not queued.id then
+                    queued.queued, queued.status, queued.waiting_for = true, "queued", "HTTP 429 cooldown"
+                end
+            end
+            save_cache()
+        else
+            source.queued, source.status, source.waiting_for = true, "queued", "HTTP 429 cooldown"
+            source.next_start = state.clock + RATE_LIMIT_COOLDOWN
+        end
+        return
+    end
+    local value, err = data.parse(kind, response)
+    if not value then source.status, source.error = "error", err; return end
+    state[kind] = value
+    source.status, source.error, source.updated_at = "ready", "", os.time()
+    if kind == "events" then
+        state.event_summary = data.summarize_events(value)
+        state.map_cursor = math.max(1, math.min(state.map_cursor, #value))
+    elseif kind == "articles" then
+        state.feed_cursor = math.max(1, math.min(state.feed_cursor, #value))
+        state.feed_scroll = math.max(0, math.min(state.feed_scroll, #value - feed_screen.VISIBLE_ROWS))
+        if #value == 0 then state.feed_detail = false end
+    end
+    if kind ~= "iss" then save_cache() end
 end
-
--- ── Lifecycle ──────────────────────────────────────────────────────────────
 
 function on_init()
     local cached = storage.load("wp_data")
-    if cached then
-        state.events = cached.events
-        state.articles = cached.articles
-        if state.events then
-            state.event_summary = data.summarize_events(state.events)
+    if type(cached) == "table" then
+        state.events = data.normalize_events(cached.events)
+        state.articles = data.normalize_articles(cached.articles)
+        for _, kind in ipairs({"events", "articles"}) do
+            if state[kind] then
+                sources[kind].status = "cached"
+                local timestamp = cached[kind .. "_at"]
+                if type(timestamp) == "number" and timestamp > 0 and timestamp <= os.time() then
+                    sources[kind].updated_at = math.floor(timestamp)
+                end
+            end
         end
+        local now, retry_at = os.time(), 0
+        for _, key in ipairs({"gdelt_retry_at", "events_retry_at", "articles_retry_at"}) do
+            local retry = cached[key]
+            if type(retry) == "number" and retry > now and retry <= now + RATE_LIMIT_COOLDOWN then
+                retry_at = math.max(retry_at, retry)
+            end
+        end
+        if retry_at > now then
+            state.gdelt_cooldown_until = retry_at - now
+            state.gdelt_next_start = retry_at - now
+            for _, kind in ipairs({"events", "articles"}) do
+                sources[kind].status, sources[kind].waiting_for = "queued", "HTTP 429 cooldown"
+            end
+        end
+        if state.events then state.event_summary = data.summarize_events(state.events) end
     end
+    if app and app.set_idle_fps then app.set_idle_fps(1) end
 end
 
 function on_update(dt)
-    state.anim_time = state.anim_time + dt
-
-    if state.screen == "boot" then
-        state.boot_time = state.boot_time + dt
-        for _, src in ipairs(state.boot_sources) do
-            if state.boot_time >= src.delay and src.status == "WAIT" then
-                src.status = "OK"
+    state.clock = state.clock + dt
+    local dirty = false
+    if http.poll then
+        local ok, responses = pcall(http.poll)
+        if ok then
+            for _, response in ipairs(responses or {}) do
+                for _, kind in ipairs(SOURCE_ORDER) do
+                    if response.id == sources[kind].id then
+                        accept_response(kind, response)
+                        dirty = true
+                        break
+                    end
+                end
+            end
+        else
+            for _, kind in ipairs(SOURCE_ORDER) do
+                local source = sources[kind]
+                if source.status == "loading" then
+                    source.status, source.error, source.timed_out = "error", "Could not read response", true
+                    dirty = true
+                end
             end
         end
-        if state.boot_time >= 2.5 then
-            state.screen = "map"
-            state.needs_initial_fetch = true
-        end
-        return
     end
-
-    if state.needs_initial_fetch then
-        state.needs_initial_fetch = false
-        fetch_all()
-        if state.events then
-            storage.save("wp_data", {events = state.events, articles = state.articles})
+    for _, kind in ipairs(SOURCE_ORDER) do
+        local source = sources[kind]
+        if source.status == "loading" and state.clock - source.started >= REQUEST_TIMEOUT then
+            source.status, source.error, source.timed_out = "error", "Request timed out", true
+            dirty = true
         end
-        return
     end
-
-    -- Periodic polling
     state.poll_timer = state.poll_timer + dt
     if state.poll_timer >= state.poll_interval then
         state.poll_timer = 0
-        fetch_all()
-        if state.events then
-            storage.save("wp_data", {events = state.events, articles = state.articles})
-        end
+        queue_refresh("events"); queue_refresh("articles")
     end
-
-    -- ISS polling
     state.iss_timer = state.iss_timer + dt
-    if state.iss_timer >= state.iss_interval then
-        state.iss_timer = 0
-        fetch_iss_only()
+    if state.iss_timer >= state.iss_interval then state.iss_timer = 0; queue_refresh("iss") end
+    state.loading = false
+    for _, kind in ipairs(SOURCE_ORDER) do
+        dirty = start_request(kind) or dirty
+        if sources[kind].status == "loading" or sources[kind].queued then state.loading = true end
     end
+    -- No animation, fabricated readiness, synchronous I/O, or idle redraw loop.
+    return dirty
 end
 
 function on_input(button, action)
-    if state.screen == "boot" then
-        if action == "press" then
-            state.screen = "map"
-            state.needs_initial_fetch = true
-        end
+    if action ~= "press" and action ~= "repeat" then return end
+    if button == "r1" or button == "l1" then
+        state.tab = (state.tab - 1 + (button == "r1" and 1 or -1)) % #TABS + 1
+        state.screen, state.feed_detail = SCREENS[state.tab], false
         return
     end
-
-    if action == "press" or action == "repeat" then
-        if button == "r1" then
-            state.tab = state.tab % #TABS + 1
-            state.screen = string.lower(TABS[state.tab])
-            return
-        elseif button == "l1" then
-            state.tab = (state.tab - 2) % #TABS + 1
-            state.screen = string.lower(TABS[state.tab])
-            return
-        end
-    end
-
-    local result = nil
-    if state.screen == "map" then
-        result = map_screen.on_input(state, button, action)
-    elseif state.screen == "news" then
-        result = feed_screen.on_input(state, button, action)
-    elseif state.screen == "stats" then
-        result = stats_screen.on_input(state, button, action)
-    end
-
+    local result
+    if state.screen == "map" then result = map_screen.on_input(state, button, action)
+    elseif state.screen == "news" then result = feed_screen.on_input(state, button, action)
+    elseif state.screen == "stats" then result = stats_screen.on_input(state, button, action) end
     if result == "refresh" then
-        fetch_all()
-        if state.events then
-            storage.save("wp_data", {events = state.events, articles = state.articles})
-        end
+        for _, kind in ipairs(SOURCE_ORDER) do queue_refresh(kind) end
+        state.poll_timer, state.iss_timer = 0, 0
     end
 end
-
--- ── Boot screen ────────────────────────────────────────────────────────────
-
-local function draw_boot()
-    local W, H = 720, 720
-    local cx, cy = W / 2, H / 2 - 60
-
-    local pulse = (math.sin(state.boot_time * 4) + 1) / 2
-    local ring_r = 60 + pulse * 10
-    screen.draw_circle(cx, cy, ring_r, 0, 30 + pulse * 20, 25 + pulse * 15)
-    screen.draw_circle(cx, cy, ring_r - 2, 10, 15, 20)
-
-    local ch_len = 20
-    screen.draw_line(cx - ring_r - ch_len, cy, cx - ring_r + 8, cy, {color = ui.colors.accent_dim, width = 1})
-    screen.draw_line(cx + ring_r - 8, cy, cx + ring_r + ch_len, cy, {color = ui.colors.accent_dim, width = 1})
-    screen.draw_line(cx, cy - ring_r - ch_len, cx, cy - ring_r + 8, {color = ui.colors.accent_dim, width = 1})
-    screen.draw_line(cx, cy + ring_r - 8, cx, cy + ring_r + ch_len, {color = ui.colors.accent_dim, width = 1})
-
-    local title = "WORLD PULSE"
-    local tw = screen.get_text_width(title, 24, true)
-    screen.draw_text(title, (W - tw) / 2, cy - 14, {color = ui.colors.accent, size = 24, bold = true})
-
-    local sub = "GLOBAL INTELLIGENCE MONITOR"
-    local sw = screen.get_text_width(sub, 10, false)
-    screen.draw_text(sub, (W - sw) / 2, cy + 16, {color = ui.colors.text_dim, size = 10})
-
-    local ver = "v0.2.0"
-    local vw = screen.get_text_width(ver, 9, false)
-    screen.draw_text(ver, (W - vw) / 2, cy + 32, {color = ui.colors.accent_dim, size = 9})
-
-    local sy = cy + 80
-    screen.draw_text("INITIALIZING SYSTEMS", cx - 70, sy, {color = ui.colors.text_dim, size = 10, bold = true})
-    sy = sy + 20
-
-    for _, src in ipairs(state.boot_sources) do
-        local status_color = src.status == "OK" and ui.colors.green or ui.colors.text_dim
-        local status_text = src.status == "OK" and "OK" or ".."
-        screen.draw_text(src.name, cx - 120, sy, {color = ui.colors.text_dim, size = 11})
-        screen.draw_text("[" .. status_text .. "]", cx + 100, sy, {
-            color = status_color, size = 11, bold = src.status == "OK",
-        })
-        sy = sy + 18
-    end
-
-    local prog = math.min(1, state.boot_time / 2.5)
-    screen.draw_progress_bar(cx - 120, sy + 10, 240, 4, prog, {
-        fill_color = ui.colors.accent, bg_color = ui.colors.panel, radius = 2,
-    })
-
-    local skip = "Press any button to skip"
-    local skw = screen.get_text_width(skip, 9, false)
-    screen.draw_text(skip, (W - skw) / 2, H - 40, {color = ui.colors.text_dim, size = 9})
-end
-
--- ── Render ─────────────────────────────────────────────────────────────────
 
 function on_render()
-    screen.clear(ui.colors.bg[1], ui.colors.bg[2], ui.colors.bg[3])
-
-    if state.screen == "boot" then
-        draw_boot()
-        return
+    local kind = state.screen == "news" and "articles" or "events"
+    local source = sources[kind]
+    U.header("World Pulse", "NEWS ATLAS / GDELT COVERAGE", source.status == "loading" and "Updating"
+        or source.status == "queued" and "Refresh queued" or source.status == "error" and "Source unavailable" or source.status == "cached" and "Saved data"
+        or source.status == "ready" and "Source updated" or "Not loaded",
+        source.status == "error" and C.red or C.muted)
+    U.tabs(TABS, state.tab)
+    if state.screen == "map" then map_screen.draw(state)
+    elseif state.screen == "news" then feed_screen.draw(state)
+    elseif state.screen == "stats" then stats_screen.draw(state) end
+    if state.screen == "news" and state.feed_detail then
+        U.footer({{"L1/R1", "View"}, {"D-PAD", "Article"}, {"B", "Back"}, {"Y", "Refresh"}})
+    else
+        local hints = {{"L1/R1", "View"}, {"Y", "Refresh"}}
+        if state.screen ~= "stats" then hints[#hints + 1] = {"D-PAD", "Select"} end
+        if state.screen == "news" then hints[#hints + 1] = {"A", "Details"} end
+        U.footer(hints)
     end
-
-    ui.draw_header("WORLD PULSE", TABS, state.tab)
-
-    if state.screen == "map" then
-        map_screen.draw(state)
-    elseif state.screen == "news" then
-        feed_screen.draw(state)
-    elseif state.screen == "stats" then
-        stats_screen.draw(state)
-    end
-
-    ui.draw_footer({
-        {"L1", "Prev", theme.btn_l},
-        {"R1", "Next", theme.btn_r},
-        {"Y", "Refresh", theme.btn_y},
-        {"\226\151\178\226\151\188", "Navigate"},
-    })
 end
