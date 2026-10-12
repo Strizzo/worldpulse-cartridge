@@ -1,133 +1,176 @@
--- lib/data.lua — Data fetching from GDELT and ISS
-
+-- Bounded response parsing. All network requests are asynchronous in main.lua.
 local M = {}
+M.MAX_EVENTS = 200
+M.MAX_ARTICLES = 75
+M.MAX_BODY = 2 * 1024 * 1024
+-- ToneAbs is a documented GDELT operator. Absolute tone > -1 includes all
+-- available numeric tones without an empty query or a fabricated topic feed.
+local query = "toneabs%3E-1"
+M.urls = {
+    events = "https://api.gdeltproject.org/api/v2/geo/geo?query=" .. query .. "&mode=pointdata&format=geojson&maxpoints=200&timespan=24h",
+    articles = "https://api.gdeltproject.org/api/v2/doc/doc?query=" .. query .. "&mode=artlist&maxrecords=75&format=json&sort=datedesc&timespan=24h",
+    iss = "http://api.open-notify.org/iss-now.json",
+}
 
---- Fetch geolocated news events from GDELT
--- Returns table of events: {lat, lon, name, url, title, tone, domain, country, image}
-function M.fetch_events()
-    local url = "https://api.gdeltproject.org/api/v2/geo/geo?query=&mode=pointdata&format=geojson&maxpoints=200&timespan=24h"
-    local resp = http.get_cached(url, 300)
-    if not resp.ok then
-        return nil, "GDELT GEO: HTTP " .. tostring(resp.status)
-    end
+local function string_value(value, limit)
+    if type(value) ~= "string" then return "" end
+    return value:sub(1, limit or 512)
+end
 
-    local data = json.decode(resp.body)
-    if not data or not data.features then
-        return nil, "GDELT GEO: bad response"
-    end
+local function finite(value)
+    local n = tonumber(value)
+    if n and n == n and n ~= math.huge and n ~= -math.huge then return n end
+end
 
-    local events = {}
-    for _, feat in ipairs(data.features) do
-        local props = feat.properties or {}
-        local geom = feat.geometry or {}
-        local coords = geom.coordinates or {}
-        if #coords >= 2 then
-            events[#events + 1] = {
-                lon     = coords[1],
-                lat     = coords[2],
-                name    = props.name or "",
-                url     = props.url or "",
-                title   = props.name or "",
-                tone    = tonumber(props.tonez) or 0,
-                domain  = props.domain or "",
-                country = props.countrycode or "",
-                image   = props.shareimage or "",
-                count   = tonumber(props.count) or 1,
-            }
+local function coordinates(lat, lon)
+    lat, lon = finite(lat), finite(lon)
+    if lat and lon and lat >= -90 and lat <= 90 and lon >= -180 and lon <= 180 then return lat, lon end
+end
+
+local function list(value)
+    return type(value) == "table" and (next(value) == nil or value[1] ~= nil)
+end
+
+local function plain(value)
+    return string_value(value, 4096):gsub("<[^>]*>", " "):gsub("&amp;", "&")
+        :gsub("&quot;", '"'):gsub("&#39;", "'"):gsub("&lt;", "<"):gsub("&gt;", ">")
+        :gsub("%s+", " "):match("^%s*(.-)%s*$")
+end
+
+function M.normalize_events(value)
+    if not list(value) then return nil end
+    local result = {}
+    for i = 1, math.min(#value, M.MAX_EVENTS) do
+        local event = value[i]
+        if type(event) == "table" then
+            local lat, lon = coordinates(event.lat, event.lon)
+            if string_value(event.name):upper():match("^%s*ERROR%s*:") then return nil end
+            if lat then
+                result[#result + 1] = {lat = lat, lon = lon,
+                    name = string_value(event.name), title = string_value(event.title),
+                    url = string_value(event.url, 2048), tone = finite(event.tone),
+                    domain = string_value(event.domain), country = string_value(event.country),
+                    count = finite(event.count), image = string_value(event.image, 2048)}
+            end
         end
     end
+    return result
+end
 
+function M.normalize_articles(value)
+    if not list(value) then return nil end
+    local result = {}
+    for i = 1, math.min(#value, M.MAX_ARTICLES) do
+        local article = value[i]
+        if type(article) == "table" then
+            result[#result + 1] = {title = string_value(article.title), url = string_value(article.url, 2048),
+                domain = string_value(article.domain), date = string_value(article.date),
+                country = string_value(article.country), language = string_value(article.language),
+                image = string_value(article.image, 2048)}
+        end
+    end
+    return result
+end
+
+local function parse_events(value)
+    if value.error == true or (type(value.error) == "string" and value.error ~= "") then
+        return nil, "Geographic source returned an error"
+    end
+    if not list(value.features) then return nil, "Response has no location list" end
+    local events = {}
+    for i = 1, math.min(#value.features, M.MAX_EVENTS) do
+        local feature = value.features[i]
+        if type(feature) == "table" then
+            local properties = type(feature.properties) == "table" and feature.properties or {}
+            -- The official legacy GKG GeoJSON service can report a backend
+            -- error as a synthetic Point at (0,0), even with HTTP 200. Never
+            -- treat that sentinel as geographic news or count it as a location.
+            if string_value(properties.name):upper():match("^%s*ERROR%s*:") then
+                return nil, "Geographic source returned an error"
+            end
+            local geometry = type(feature.geometry) == "table" and feature.geometry or {}
+            local coords = type(geometry.coordinates) == "table" and geometry.coordinates or {}
+            local lat, lon = coordinates(coords[2], coords[1])
+            if lat and (not geometry.type or geometry.type == "Point") then
+                -- PointData is a list of mentioned locations, not discrete events.
+                -- Some responses provide article links only in the popup HTML.
+                local html = string_value(properties.html, 16384)
+                local url = string_value(properties.url, 2048)
+                local title = string_value(properties.title)
+                if url == "" then url = html:match([=[href=["'](https?://.-)["']]=]) or "" end
+                if title == "" then title = string_value(plain(html:match('<a[^>]*>(.-)</a>') or "")) end
+                events[#events + 1] = {
+                    lat = lat, lon = lon, name = string_value(properties.name),
+                    title = title, url = url, tone = finite(properties.tonez or properties.tone),
+                    domain = string_value(properties.domain) ~= "" and string_value(properties.domain)
+                        or (url:match("^https?://([^/]+)") or ""),
+                    country = string_value(properties.countrycode or properties.country),
+                    count = finite(properties.count), image = string_value(properties.shareimage, 2048),
+                }
+            end
+        end
+    end
+    if #value.features > 0 and #events == 0 then return nil, "Response has no valid point coordinates" end
     return events
 end
 
---- Fetch news articles from GDELT
--- Returns table of articles: {title, url, domain, date, country, language, image}
-function M.fetch_articles()
-    local url = "https://api.gdeltproject.org/api/v2/doc/doc?query=&mode=artlist&maxrecords=75&format=json&sort=datedesc"
-    local resp = http.get_cached(url, 300)
-    if not resp.ok then
-        return nil, "GDELT DOC: HTTP " .. tostring(resp.status)
-    end
-
-    local data = json.decode(resp.body)
-    if not data or not data.articles then
-        return nil, "GDELT DOC: bad response"
-    end
-
+local function parse_articles(value)
+    if not list(value.articles) then return nil, "Response has no article list" end
     local articles = {}
-    for _, art in ipairs(data.articles) do
-        articles[#articles + 1] = {
-            title    = art.title or "",
-            url      = art.url or "",
-            domain   = art.domain or "",
-            date     = art.seendate or "",
-            country  = art.sourcecountry or "",
-            language = art.language or "",
-            image    = art.socialimage or "",
-        }
+    for i = 1, math.min(#value.articles, M.MAX_ARTICLES) do
+        local article = value.articles[i]
+        if type(article) == "table" then
+            articles[#articles + 1] = {title = article.title, url = article.url, domain = article.domain,
+                date = article.seendate, country = article.sourcecountry, language = article.language,
+                image = article.socialimage}
+        end
     end
-
-    return articles
+    return M.normalize_articles(articles)
 end
 
---- Fetch ISS position
-function M.fetch_iss()
-    local resp = http.get("http://api.open-notify.org/iss-now.json")
-    if not resp.ok then
-        return nil, "ISS: HTTP " .. tostring(resp.status)
-    end
-
-    local data = json.decode(resp.body)
-    if not data or not data.iss_position then
-        return nil, "ISS: bad response"
-    end
-
-    return {
-        lat = tonumber(data.iss_position.latitude) or 0,
-        lon = tonumber(data.iss_position.longitude) or 0,
-        timestamp = data.timestamp or os.time(),
-    }
+local function parse_iss(value)
+    local position = value.iss_position
+    if type(position) ~= "table" then return nil, "Response has no ISS position" end
+    local lat, lon = coordinates(position.latitude, position.longitude)
+    if not lat then return nil, "Response has invalid ISS coordinates" end
+    local timestamp = finite(value.timestamp)
+    if timestamp and (timestamp < 0 or timestamp > os.time() + 300) then timestamp = nil end
+    return {lat = lat, lon = lon, timestamp = timestamp and math.floor(timestamp)}
 end
 
---- Summarize events for the stats screen
+function M.parse(kind, response)
+    if type(response) ~= "table" or not response.ok then
+        local status = type(response) == "table" and response.status or "error"
+        if kind == "events" and status == 404 then
+            return nil, "Geographic endpoint unavailable (HTTP 404)"
+        end
+        return nil, "HTTP " .. tostring(status)
+    end
+    if type(response.body) ~= "string" or #response.body > M.MAX_BODY then return nil, "Response too large or missing" end
+    local ok, value = pcall(json.decode, response.body)
+    if not ok or type(value) ~= "table" then return nil, "Response is not valid JSON" end
+    if kind == "events" then return parse_events(value) end
+    if kind == "articles" then return parse_articles(value) end
+    if kind == "iss" then return parse_iss(value) end
+    return nil, "Unknown source"
+end
+
 function M.summarize_events(events)
-    if not events or #events == 0 then
-        return {total = 0, negative = 0, neutral = 0, positive = 0, countries = {}}
+    local summary = {total = 0, negative = 0, neutral = 0, positive = 0, unscored = 0, countries = {}}
+    local counts = {}
+    for _, event in ipairs(events or {}) do
+        summary.total = summary.total + 1
+        if type(event.tone) ~= "number" then summary.unscored = summary.unscored + 1
+        elseif event.tone < -3 then summary.negative = summary.negative + 1
+        elseif event.tone > 3 then summary.positive = summary.positive + 1
+        else summary.neutral = summary.neutral + 1 end
+        if event.country and event.country ~= "" then counts[event.country] = (counts[event.country] or 0) + 1 end
     end
-
-    local total = #events
-    local negative, neutral, positive = 0, 0, 0
-    local country_counts = {}
-
-    for _, ev in ipairs(events) do
-        if ev.tone < -3 then
-            negative = negative + 1
-        elseif ev.tone > 3 then
-            positive = positive + 1
-        else
-            neutral = neutral + 1
-        end
-
-        local c = ev.country
-        if c and c ~= "" then
-            country_counts[c] = (country_counts[c] or 0) + 1
-        end
-    end
-
-    -- Top countries by event count
-    local countries = {}
-    for code, count in pairs(country_counts) do
-        countries[#countries + 1] = {code = code, count = count}
-    end
-    table.sort(countries, function(a, b) return a.count > b.count end)
-
-    return {
-        total = total,
-        negative = negative,
-        neutral = neutral,
-        positive = positive,
-        countries = countries,
-    }
+    for code, count in pairs(counts) do summary.countries[#summary.countries + 1] = {code = code, count = count} end
+    table.sort(summary.countries, function(a, b)
+        return a.count == b.count and a.code < b.code or a.count > b.count
+    end)
+    return summary
 end
 
 return M

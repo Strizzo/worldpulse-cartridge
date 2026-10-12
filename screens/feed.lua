@@ -1,114 +1,65 @@
--- screens/feed.lua — Global news article feed
-
+-- Headline list and metadata details. Article bodies are not fetched.
+local U = _G.ui.public
+local C = U.C
 local ui = require("lib.ui")
+local M = {VISIBLE_ROWS = 4}
+local ROW_H = 88
 
-local M = {}
-
-local VISIBLE_ROWS = 11
-local ROW_H = 58
-local CONTENT_Y = 42
+local function draw_detail(state, article)
+    U.panel(24, 170, 672, 460, C.panel, C.red)
+    U.text("ARTICLE / " .. state.feed_cursor .. " OF " .. #state.articles, 40, 184, 14, C.muted, 632, true)
+    ui.lines(article.title ~= "" and article.title or "Headline not supplied", 40, 220, 632, 24, 6, C.paper, true)
+    U.rule(40, 418, 632)
+    U.text(ui.short_domain(article.domain), 40, 434, 18, C.teal, 632, true)
+    U.text(ui.format_date(article.date), 40, 464, 16, C.muted, 632)
+    U.text((article.country ~= "" and article.country or "Country not supplied") .. " / " ..
+        (article.language ~= "" and article.language or "Language not supplied"), 40, 494, 16, C.muted, 632)
+    ui.lines(article.url ~= "" and article.url or "Article URL not supplied", 40, 528, 632, 14, 2, C.muted)
+    U.text("GDELT headline metadata. Article body is not included.", 40, 602, 14, C.quiet, 632)
+end
 
 function M.draw(state)
-    local W = 720
     local articles = state.articles or {}
-
-    -- Column headers
-    screen.draw_rect(0, CONTENT_Y, W, 18, {color = ui.colors.panel, filled = true})
-    screen.draw_text("SOURCE", 12, CONTENT_Y + 2, {color = ui.colors.text_dim, size = 10, bold = true})
-    screen.draw_text("HEADLINE", 160, CONTENT_Y + 2, {color = ui.colors.text_dim, size = 10, bold = true})
-    screen.draw_text("TIME", 640, CONTENT_Y + 2, {color = ui.colors.text_dim, size = 10, bold = true})
-
-    if #articles == 0 then
-        screen.draw_text("No articles loaded", W / 2 - 60, 300, {color = ui.colors.text_dim, size = 14})
-        return
-    end
-
-    local list_y = CONTENT_Y + 20
-    local start_idx = state.feed_scroll + 1
-    local end_idx = math.min(#articles, start_idx + VISIBLE_ROWS - 1)
-
-    for i = start_idx, end_idx do
-        local art = articles[i]
-        local ry = list_y + (i - start_idx) * ROW_H
-        local is_selected = (i == state.feed_cursor)
-
-        -- Row background
-        local row_bg = is_selected and ui.colors.panel_b or (i % 2 == 0 and ui.colors.panel or ui.colors.bg)
-        screen.draw_rect(0, ry, W, ROW_H, {color = row_bg, filled = true})
-
-        if is_selected then
-            screen.draw_rect(0, ry, 3, ROW_H, {color = ui.colors.accent, filled = true})
+    if state.feed_detail and articles[state.feed_cursor] then
+        draw_detail(state, articles[state.feed_cursor])
+    elseif #articles == 0 then
+        local loading = state.sources.articles.status == "loading"
+        local body = state.articles and "GDELT returned an empty article list for the past 24 hours. Y refreshes."
+            or loading and "Headlines are loading. You can switch views while the request is pending."
+            or "The news source has not returned usable data. Y retries; saved headlines appear when available."
+        U.empty(loading and "Loading headlines" or "No headlines", body, 230)
+    else
+        U.text("24h source window / headlines", 24, 158, 14, C.muted, 500)
+        U.text(string.format("%d / %d", state.feed_cursor, #articles), 580, 158, 14, C.muted, 116)
+        for index = state.feed_scroll + 1, math.min(#articles, state.feed_scroll + M.VISIBLE_ROWS) do
+            local article = articles[index]
+            local y = 184 + (index - state.feed_scroll - 1) * ROW_H
+            local fg, secondary = U.row(24, y, 672, ROW_H - 6, index == state.feed_cursor)
+            U.text(ui.short_domain(article.domain), 40, y + 8, 14, secondary, 388, true)
+            U.text(ui.format_date(article.date), 468, y + 8, 14, secondary, 212)
+            ui.lines(article.title ~= "" and article.title or "Headline not supplied", 40, y + 31, 632, 18, 2, fg, true)
         end
-
-        -- Source domain
-        local domain = ui.short_domain(art.domain)
-        screen.draw_text(domain, 12, ry + 8, {color = ui.colors.accent, size = 11, bold = true, max_width = 140})
-
-        -- Country
-        if art.country and art.country ~= "" then
-            screen.draw_text(art.country, 12, ry + 26, {
-                color = ui.colors.text_dim, size = 9, max_width = 140,
-            })
-        end
-
-        -- Language pill
-        if art.language and art.language ~= "" then
-            local lang = art.language:sub(1, 3):upper()
-            screen.draw_pill(lang, 12, ry + 40, 30, 45, 55, {
-                text_color = ui.colors.text_dim, size = 8,
-            })
-        end
-
-        -- Headline (single line, truncated with ..)
-        screen.draw_text(art.title, 160, ry + 14, {
-            color = ui.colors.text, size = 13, max_width = 470,
-        })
-
-        -- Time
-        screen.draw_text(ui.format_date(art.date), 640, ry + 8, {
-            color = ui.colors.text_dim, size = 10,
-        })
-
-        -- Separator
-        screen.draw_line(0, ry + ROW_H - 1, W, ry + ROW_H - 1, {color = {20, 30, 40}, width = 1})
+        local selected = articles[state.feed_cursor]
+        U.panel(24, 548, 672, 84, C.panel2)
+        U.text((selected.country ~= "" and selected.country or "Country not supplied") .. " / " ..
+            (selected.language ~= "" and selected.language or "Language not supplied"), 40, 562, 16, C.muted, 632)
+        U.text("A opens headline details and source URL.", 40, 602, 14, C.paper, 632)
     end
-
-    -- Scroll indicator
-    if #articles > VISIBLE_ROWS then
-        local bar_h = 620
-        local thumb_h = math.max(20, bar_h * VISIBLE_ROWS / #articles)
-        local thumb_y = list_y + (bar_h - thumb_h) * state.feed_scroll / math.max(1, #articles - VISIBLE_ROWS)
-        screen.draw_rect(W - 4, list_y, 3, bar_h, {color = ui.colors.panel, filled = true, radius = 1})
-        screen.draw_rect(W - 4, thumb_y, 3, thumb_h, {color = ui.colors.accent_dim, filled = true, radius = 1})
-    end
-
-    -- Count
-    local count_text = string.format("%d of %d articles", end_idx, #articles)
-    local cw = screen.get_text_width(count_text, 10, false)
-    screen.draw_text(count_text, W - cw - 12, CONTENT_Y + 2, {color = ui.colors.text_dim, size = 10})
+    ui.source_line(state, "articles")
 end
 
 function M.on_input(state, button, action)
-    if action ~= "press" and action ~= "repeat" then return nil end
-
+    if action ~= "press" and action ~= "repeat" then return end
+    -- Refresh is available even when the feed is empty or has failed.
+    if button == "y" then return "refresh" end
+    if button == "b" then state.feed_detail = false; return end
     local n = state.articles and #state.articles or 0
-    if n == 0 then return nil end
-
-    if button == "dpad_down" then
-        state.feed_cursor = math.min(n, state.feed_cursor + 1)
-        if state.feed_cursor > state.feed_scroll + VISIBLE_ROWS then
-            state.feed_scroll = state.feed_cursor - VISIBLE_ROWS
-        end
-    elseif button == "dpad_up" then
-        state.feed_cursor = math.max(1, state.feed_cursor - 1)
-        if state.feed_cursor <= state.feed_scroll then
-            state.feed_scroll = state.feed_cursor - 1
-        end
-    elseif button == "y" then
-        return "refresh"
-    end
-
-    return nil
+    if n == 0 then return end
+    if button == "a" then state.feed_detail = true
+    elseif button == "dpad_down" then state.feed_cursor = math.min(n, state.feed_cursor + 1)
+    elseif button == "dpad_up" then state.feed_cursor = math.max(1, state.feed_cursor - 1) end
+    if state.feed_cursor > state.feed_scroll + M.VISIBLE_ROWS then state.feed_scroll = state.feed_cursor - M.VISIBLE_ROWS
+    elseif state.feed_cursor <= state.feed_scroll then state.feed_scroll = state.feed_cursor - 1 end
 end
 
 return M

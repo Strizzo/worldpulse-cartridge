@@ -1,0 +1,13 @@
+[
+  "assets/map.png",
+  "cartridge.json",
+  "icon.png",
+  "icon_focused.png",
+  "lib/data.lua",
+  "lib/geo.lua",
+  "lib/ui.lua",
+  "main.lua",
+  "screens/feed.lua",
+  "screens/map.lua",
+  "screens/stats.lua"
+]
